@@ -73,8 +73,6 @@ blueprint:
 
   domain: automation
 
-  domain: automation
-
   input:
     core_settings:
       name: Core Settings
@@ -82,7 +80,7 @@ blueprint:
         run_time:
           name: Run time
           description: Time when this automation should run daily
-          default: "14:30:00"
+          default: "19:30:00"
           selector:
             time:
             
