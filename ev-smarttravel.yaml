@@ -1,21 +1,21 @@
 blueprint:
   name: Smart EV Travel Planning & Charging
   description: >
-    VERSION: v2.6.1<br>
+    VERSION: v2.6.2<br>
 
     ───────────────<br>
     REQUIRED<br>
     ───────────────<br>
-    • Calendar entity<br>
+    • Calendar entity with location-based events<br>
     • Person entity (home location)<br>
     • Google Travel Time integration (via input_text)<br>
-    <br>
+
     ───────────────<br>
     OPTIONAL MODULES<br>
     ───────────────<br>
 
-    Travel assistant:<br>
-    • input_boolean.not_returning_home → Used to skip return trip<br>
+    Travel Assistant:<br>
+    • input_boolean.not_returning_home → Skip return trip calculation<br>
 
     Preconditioning:<br>
     • input_datetime.ev_preheat_time → Stores calculated preheat start time<br>
@@ -32,24 +32,46 @@ blueprint:
 
     1. Reads all calendar events with a location for the next day<br>
     2. Calculates driving time + distance using Google Travel Time<br>
-    3. Optionally creates "Travel" events in your calendar (before each appointment)<br>
-    4. Calculates total distance including return trip (unless disabled)<br>
+    3. Automatically creates "Travel" events in your calendar (before each appointment)<br>
+    4. Plans total distance including optional return trip home<br>
     5. Calculates smart target SOC with configurable safety buffer<br>
     6. Sets target SOC for your EV Smart Charge integration<br>
-    7. Optionally calculates and stores preconditioning start time<br>
-    8. Sends a notification with summary<br>
+    7. Calculates preconditioning start time (first travel block start – buffer)<br>
+    8. Sends notification with summary & charging recommendations<br>
 
     ───────────────<br>
-    NOTES & TIPS<br>
+    EXAMPLE WORKFLOW<br>
     ───────────────<br>
 
-    • All modules outside Core Settings are fully optional<br>
-    • Events are automatically sorted by start time<br>
+    Meeting at 09:00 (location: Work)<br>
+    → Calculates 30min travel time<br>
+    → Creates Travel event: 08:00–09:00<br>
+    → Preconditioning (20min buffer): starts at 07:40<br>
+    → Google uses 60min earlier departure for traffic accuracy (first trip only)<br>
+
+    ───────────────<br>
+    KEY FEATURES<br>
+    ───────────────<br>
+
+    • Smart Zone Matching: "home"/"thuis" → zone.home | "werk"/"office"/"kantoor" → zone.werk<br>
+    • Traffic-Aware Timing: First trip uses 60 minutes earlier departure for Google API (subsequent trips use previous event end time)<br>
+    • Preconditioning Alignment: Preheat starts at (first travel block start – buffer) so your car is ready exactly when needed<br>
+    • Configurable Execution Time: Set daily run time (default 14:30 for next-day planning)<br>
     • Supports km only<br>
-    • Distance unit and safety buffer are configurable in the Travel Assistant section<br>
-    • Works best with Google Calendar + Google Travel Time integration<br>
-    • For Waze, not tested yet as I cannot getting it to work in my HA <br>
+    • All modules outside Core Settings are fully optional<br>
 
+    ───────────────<br>
+    TIPS & BEST PRACTICES<br>
+    ───────────────<br>
+
+    • Works best with Google Calendar + Google Travel Time integration<br>
+    • waze will be tested in the future (because it does not worjk in my HA) 
+    • Pair with EV Smart Charge blueprint for automatic charging optimization<br>
+    • Use input_boolean.not_returning_home to skip return trip on specific days<br>
+    • Adjust safety buffer % based on your charging preferences (default 15%)<br>
+    • Monitor preconditioning times via your preheat input_datetime entity<br>
+
+  domain: automation
 
   domain: automation
 
@@ -376,6 +398,7 @@ action:
       total_distance_m: 0
       total_duration: 0
       last_end_time: ""
+      first_travel_start: 0
 
   - repeat:
       count: "{{ events | count }}"
@@ -416,7 +439,7 @@ action:
                   continue_on_error: true
                   response_variable: t
                   data:
-                    config_entry_id: "{{ states(google_api) }}"
+                    config_entry_id: "{{ states(google_api) if google_api != '' else none }}"
                     origin: "{{ origin }}"
                     destination: "{{ event_location }}"
                     departure_time: "{{ travel_departure_time }}"
@@ -436,6 +459,16 @@ action:
             #dist: "{{ t.routes[0].distance_meters | default(0) | int if t.routes is defined else 0 }}"
             dist: "{{ (t.routes[0].distance_meters if t.routes is defined and t.routes | count > 0 else 0) | int }}"
             dur: "{{ (t.routes[0].duration if t.routes is defined and t.routes | count > 0 else 0) | int }}"
+            first_travel_start: >
+              {% if repeat.index == 1 %}
+                {% if dur | int > 0 %}
+                  {{ as_timestamp(e.start) - dur }}
+                {% else %}
+                  {{ as_timestamp(e.start) }}
+                {% endif %}
+              {% else %}
+                {{ first_travel_start | default(0) }}
+              {% endif %}
 
         - choose:
             - conditions: "{{ enable_travel and dur > 0 }}"
@@ -565,7 +598,7 @@ action:
               option: None
 
       - conditions:
-          - "{{ target_soc > 0 and events | count > 0 }}"
+          - "{{ charging_needed_before_trip and events | count > 0 }}"
         sequence:
           - variables:
               vertrek_ts: "{{ as_timestamp(events[0].start) - 1800 }}"
@@ -597,11 +630,13 @@ action:
       - conditions: "{{ enable_precond and preheat_entity != '' and events|count > 0 }}"
         sequence:
           - variables:
-              # Precondition only before first meeting
-              first_start: "{{ events[0].start }}"
-              # Gebruik geschatte reistijd van de eerste rit (niet totaal) voor preheat start indien gewenst, 
-              # maar hier behouden we de logica gebaseerd op aankomst bij afspraak minus buffer.
-              preheat_start: "{{ (as_timestamp(first_start) - (total_duration * 60) - (preheat_buffer * 60)) | timestamp_local }}"
+              # Preconditioning start before the first travel block
+              preheat_start: >
+                {% if first_travel_start | int > 0 %}
+                  {{ (first_travel_start - (preheat_buffer * 60)) | timestamp_local }}
+                {% else %}
+                  {{ ((as_timestamp(events[0].start) - (preheat_buffer * 60))) | timestamp_local }}
+                {% endif %}
           - action: input_datetime.set_datetime
             target:
               entity_id: "{{ preheat_entity }}"
